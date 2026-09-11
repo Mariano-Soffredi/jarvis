@@ -1,0 +1,20 @@
+name: go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      # -race is not optional here: Score documents that one model is safe to
+      # score from many goroutines, and TestConcurrentScoreIsSafe is the only
+      # thing holding that promise up. Without the flag it proves nothing.
+      - run: go test -race ./...
