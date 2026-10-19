@@ -1,6 +1,8 @@
 package codex
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -31,7 +33,7 @@ func newNet(t *testing.T, cfg Config, rng *rand.Rand) *Net {
 
 func mustScore(t *testing.T, m *Net, in [][]float64) []float64 {
 	t.Helper()
-	out, err := m.Score(in)
+	out, _, err := m.Score(in, nil)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -333,7 +335,7 @@ func TestScoreRejectsNonFiniteFeatures(t *testing.T) {
 	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		in := stocks(5, 4)
 		in[3][2] = bad
-		if _, err := m.Score(in); err == nil {
+		if _, _, err := m.Score(in, nil); err == nil {
 			t.Errorf("Score accepted %v as a feature", bad)
 		}
 	}
@@ -341,14 +343,14 @@ func TestScoreRejectsNonFiniteFeatures(t *testing.T) {
 
 func TestScoreRejectsWrongFeatureCount(t *testing.T) {
 	m := newNet(t, testConfig(), seeded(1))
-	if _, err := m.Score([][]float64{{1, 2, 3, 4}, {1, 2}}); err == nil {
+	if _, _, err := m.Score([][]float64{{1, 2, 3, 4}, {1, 2}}, nil); err == nil {
 		t.Error("Score accepted a row with the wrong feature count")
 	}
 }
 
 func TestScoreAcceptsNoStocks(t *testing.T) {
 	m := newNet(t, testConfig(), seeded(1))
-	out, err := m.Score(nil)
+	out, _, err := m.Score(nil, nil)
 	if err != nil {
 		t.Fatalf("Score(nil): %v", err)
 	}
@@ -366,6 +368,9 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"zero-width enc":  func(c *Config) { c.Encoder = []int{8, 0} },
 		"no mix":          func(c *Config) { c.Mix = 0 },
 		"zero-width head": func(c *Config) { c.Head = []int{0} },
+		"negative ctx":    func(c *Config) { c.Context = -1 },
+		"huge ctx":        func(c *Config) { c.Context = 1 << 62 },
+		"zero-width pool": func(c *Config) { c.Pool = []int{0} },
 	}
 	for name, corrupt := range tests {
 		cfg := testConfig()
@@ -390,7 +395,7 @@ func TestConcurrentScoreIsSafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 20 {
-				got, err := m.Score(in)
+				got, _, err := m.Score(in, nil)
 				if err != nil {
 					t.Errorf("concurrent Score: %v", err)
 					return
@@ -424,7 +429,7 @@ func Example() {
 
 	best, bestScore := population[0], math.Inf(-1)
 	for _, m := range population {
-		valuations, err := m.Score(today)
+		valuations, _, err := m.Score(today, nil)
 		if err != nil {
 			panic(err)
 		}
@@ -437,7 +442,178 @@ func Example() {
 		population[i] = best.Mutated(0.05, rng)
 	}
 
-	valuations, _ := best.Score(today)
+	valuations, _, _ := best.Score(today, nil)
 	fmt.Println(len(valuations), best.ParamCount())
 	// Output: 3 197
+}
+
+func digest(vs ...[]float64) string {
+	h := sha256.New()
+	for _, v := range vs {
+		for _, x := range v {
+			binary.Write(h, binary.LittleEndian, math.Float64bits(x))
+		}
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// The digest was taken from v0.0.0-20260911150921-dbd85ce4bb38 at strategy's
+// default shape. It pins init draw order, Params order, Mutated's draw order
+// and Score's bits, which is what keeps stored champions loadable.
+func TestNoContextNoPoolMatchesThePreviousRelease(t *testing.T) {
+	m := newNet(t, Config{FeaturesPerStock: 41, Encoder: []int{8, 8}, Mix: 8}, seeded(3))
+	child := m.Mutated(0.1, seeded(4))
+	in := stocks(30, 41)
+
+	a, pa, err := m.Score(in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := mustScore(t, child, in)
+
+	if got := m.ParamCount(); got != 553 {
+		t.Errorf("ParamCount = %d, want 553", got)
+	}
+	if pa != 0 {
+		t.Errorf("pool output without a pool = %v, want 0", pa)
+	}
+	const want = "1c39f70d6eddec6e96b5b99f4454458c06899e5541ff7fbb9533cf3b05624dd5"
+	if got := digest(m.Params(), child.Params(), a, b); got != want {
+		t.Errorf("digest = %s, want %s", got, want)
+	}
+}
+
+func TestContextAddsMixTimesContextParams(t *testing.T) {
+	cfg := testConfig()
+	base := newNet(t, cfg, seeded(1)).ParamCount()
+	cfg.Context = 3
+	if got, want := newNet(t, cfg, seeded(1)).ParamCount(), base+cfg.Mix*3; got != want {
+		t.Errorf("ParamCount = %d, want %d", got, want)
+	}
+}
+
+func TestValuationAndPoolDependOnContext(t *testing.T) {
+	cfg := testConfig()
+	cfg.Context, cfg.Pool = 2, []int{}
+	m := newNet(t, cfg, seeded(1))
+	in := stocks(4, 4)
+
+	calm, pc, err := m.Score(in, []float64{0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wild, pw, err := m.Score(in, []float64{3, -3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calm[0] == wild[0] {
+		t.Errorf("valuation %v ignored the context", calm[0])
+	}
+	if pc == pw {
+		t.Errorf("pool output %v ignored the context", pc)
+	}
+}
+
+func TestScoreRejectsBadContext(t *testing.T) {
+	cfg := testConfig()
+	cfg.Context = 2
+	m := newNet(t, cfg, seeded(1))
+	for _, ctx := range [][]float64{nil, {1}, {1, 2, 3}, {1, math.NaN()}, {math.Inf(1), 0}, {0, math.Inf(-1)}} {
+		if _, _, err := m.Score(stocks(3, 4), ctx); err == nil {
+			t.Errorf("Score accepted context %v", ctx)
+		}
+	}
+	if _, _, err := newNet(t, testConfig(), seeded(1)).Score(stocks(3, 4), []float64{1}); err == nil {
+		t.Error("a net without context accepted one")
+	}
+}
+
+// Identity activation, by hand for rows [1] and [3] with ctx [0.5]:
+//
+//	e = 2x+0.5: e0 = 2.5, e1 = 6.5, market = 4.5
+//	mix = e + 3*market + 4*ctx: mix0 = 18, mix1 = 22
+//	out = 10*mix - 1: 179, 219
+//	pool = 2*market + 5*ctx + 1 = 12.5
+func TestForwardPassWithContextAndPool(t *testing.T) {
+	identity := func(x float64) float64 { return x }
+	cfg := Config{FeaturesPerStock: 1, Encoder: []int{1}, Mix: 1, Context: 1, Pool: []int{}, Hidden: identity}
+	m := newNet(t, cfg, seeded(1))
+
+	// each()'s order: enc, mix (columns e, market, ctx), head, pool (columns market, ctx)
+	if err := m.SetParams([]float64{2, 0.5, 1, 3, 4, 0, 10, -1, 2, 5, 1}); err != nil {
+		t.Fatalf("SetParams: %v", err)
+	}
+
+	got, pool, err := m.Score([][]float64{{1}, {3}}, []float64{0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []float64{179, 219}; !slices.Equal(got, want) {
+		t.Errorf("valuations %v, want %v", got, want)
+	}
+	if pool != 12.5 {
+		t.Errorf("pool %v, want 12.5", pool)
+	}
+}
+
+// Appending the pool last in each() and in New's draws is what lets a stored
+// champion be padded into a net with a fresh pooled head.
+func TestPoolIsAppendedLast(t *testing.T) {
+	cfg := testConfig()
+	cfg.Context = 2
+	plain := newNet(t, cfg, seeded(5))
+	cfg.Pool = []int{3}
+	pooled := newNet(t, cfg, seeded(5))
+
+	embed := cfg.Encoder[len(cfg.Encoder)-1]
+	extra := (embed+2)*3 + 3 + 3 + 1
+	if got, want := pooled.ParamCount(), plain.ParamCount()+extra; got != want {
+		t.Fatalf("ParamCount = %d, want %d", got, want)
+	}
+	if !slices.Equal(pooled.Params()[:plain.ParamCount()], plain.Params()) {
+		t.Error("the pooled net's params do not start with the plain net's")
+	}
+
+	in, ctx := stocks(5, 4), []float64{1, -1}
+	a, _, _ := plain.Score(in, ctx)
+	b, _, _ := pooled.Score(in, ctx)
+	if !slices.Equal(a, b) {
+		t.Errorf("adding a pool changed the valuations: %v vs %v", a, b)
+	}
+}
+
+func TestCloneAndMutatedCarryContextAndPool(t *testing.T) {
+	cfg := testConfig()
+	cfg.Context, cfg.Pool = 2, []int{3}
+	m := newNet(t, cfg, seeded(1))
+	in, ctx := stocks(5, 4), []float64{1, -1}
+	want, wantPool, _ := m.Score(in, ctx)
+
+	clone := m.Clone()
+	got, gotPool, err := clone.Score(in, ctx)
+	if err != nil {
+		t.Fatalf("clone Score: %v", err)
+	}
+	if !slices.Equal(got, want) || gotPool != wantPool {
+		t.Errorf("clone scored %v %v, want %v %v", got, gotPool, want, wantPool)
+	}
+	cp := clone.Params()
+	cp[len(cp)-1] += 1
+	if err := clone.SetParams(cp); err != nil {
+		t.Fatal(err)
+	}
+	if _, p, _ := m.Score(in, ctx); p != wantPool {
+		t.Error("changing the clone's pool changed the original")
+	}
+
+	before := m.Params()
+	after := m.Mutated(0.1, seeded(9)).Params()
+	if len(after) != len(before) {
+		t.Fatalf("Mutated has %d params, want %d", len(after), len(before))
+	}
+	for i := range before {
+		if before[i] == after[i] {
+			t.Fatalf("param %d of %d unchanged by Mutated", i, len(before))
+		}
+	}
 }
