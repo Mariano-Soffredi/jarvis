@@ -13,7 +13,7 @@ func benchScore(b *testing.B, act Activation) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := m.Score(in); err != nil {
+		if _, _, err := m.Score(in, nil); err != nil {
 			b.Fatal(err)
 		}
 	}

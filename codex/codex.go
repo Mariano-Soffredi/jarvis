@@ -13,8 +13,9 @@
 //
 //	features -> encoder -> e_i          per item, shared weights
 //	           market = mean(e_1..e_n)
-//	           [e_i || market] -> mix   per item, shared weights
+//	           [e_i || market || ctx] -> mix   per item, shared weights
 //	           -> head -> 1 scalar
+//	           [market || ctx] -> pool -> 1 scalar   optional, once per call
 //
 // Items influence each other through that market average and nowhere else, which
 // makes Score permutation-equivariant to floating-point precision: reorder the
@@ -68,6 +69,14 @@ type Config struct {
 	// Head holds the hidden widths between the mix layer and the single output
 	// valuation. May be empty.
 	Head []int
+	// Context is the length of the ctx vector Score is given: features of the
+	// day rather than of any item, read by the mix layer and the pool. Zero
+	// builds the same net as a release without it.
+	Context int
+	// Pool holds the hidden widths of an optional head reading [market || ctx]
+	// and returning one scalar per Score call. nil means no pool; an empty
+	// non-nil slice means a linear one.
+	Pool []int
 	// Hidden defaults to math.Tanh, which cannot produce dead units and keeps
 	// activations bounded as mutation drives weights outward.
 	Hidden Activation
@@ -82,12 +91,13 @@ type dense struct {
 }
 
 // forward returns the prefix of scratch it wrote. A nil act leaves it linear.
-func (d *dense) forward(scratch, src []float64, act Activation) []float64 {
+// It reads only the first len(src) columns of w, so the mix layer can pass its
+// context columns already folded into bias.
+func (d *dense) forward(scratch, src, bias []float64, act Activation) []float64 {
 	dst := scratch[:d.out]
-	src = src[:d.in]
 	for o := range dst {
-		row := d.w[o*d.in : (o+1)*d.in]
-		sum := d.b[o]
+		row := d.w[o*d.in : o*d.in+len(src)]
+		sum := bias[o]
 		for i, x := range src {
 			sum += row[i] * x
 		}
@@ -105,9 +115,11 @@ func (d *dense) forward(scratch, src []float64, act Activation) []float64 {
 // rejects one; the other methods report an empty model.
 type Net struct {
 	features int
+	ctx      int
 	enc      []dense
 	mix      dense
 	head     []dense
+	pool     []dense
 	act      Activation
 }
 
@@ -132,6 +144,12 @@ func New(cfg Config, rng *rand.Rand) (*Net, error) {
 	if err := checkDims("Head", cfg.Head); err != nil {
 		return nil, err
 	}
+	if cfg.Context < 0 || cfg.Context > maxDim {
+		return nil, fmt.Errorf("codex: Context must be in 0..%d, got %d", maxDim, cfg.Context)
+	}
+	if err := checkDims("Pool", cfg.Pool); err != nil {
+		return nil, err
+	}
 	if rng == nil {
 		return nil, fmt.Errorf("codex: rng must not be nil")
 	}
@@ -141,14 +159,17 @@ func New(cfg Config, rng *rand.Rand) (*Net, error) {
 		act = math.Tanh
 	}
 
-	c := &Net{features: cfg.FeaturesPerStock, act: act}
+	c := &Net{features: cfg.FeaturesPerStock, ctx: cfg.Context, act: act}
 	c.enc = stack(append([]int{cfg.FeaturesPerStock}, cfg.Encoder...), rng)
 
 	embed := cfg.Encoder[len(cfg.Encoder)-1]
-	// The mix layer reads an embedding concatenated with the market average.
-	c.mix = newDense(2*embed, cfg.Mix, rng)
+	c.mix = newDense(2*embed+cfg.Context, cfg.Mix, rng)
 
 	c.head = stack(append(append([]int{cfg.Mix}, cfg.Head...), 1), rng)
+	// Drawn last, so a net without a pool consumes rng exactly as before.
+	if cfg.Pool != nil {
+		c.pool = stack(append(append([]int{embed + cfg.Context}, cfg.Pool...), 1), rng)
+	}
 	return c, nil
 }
 
@@ -180,8 +201,11 @@ func newDense(in, out int, rng *rand.Rand) dense {
 	return dense{w: w, b: make([]float64, out), in: in, out: out}
 }
 
-// Score returns one raw valuation per input row, in the same order. Valuations
-// are unbounded; normalising them into allocations is the caller's job.
+// Score returns one raw valuation per input row, in the same order, and the
+// pool's output. Valuations are unbounded; normalising them into allocations is
+// the caller's job. ctx must have Config.Context entries, so nil when that is
+// 0. The pool's output is 0 for a net without a pool, and when stocks is empty,
+// since there is no market to pool.
 //
 // Score never writes to the model or to the input, so one Net may be scored from
 // many goroutines at once - but not while another goroutine is inside SetParams,
@@ -190,22 +214,31 @@ func newDense(in, out int, rng *rand.Rand) dense {
 // Every feature must be finite. Checking here rather than on the output is not
 // paranoia: math.Tanh(math.Inf(1)) is exactly 1, so under the default activation
 // an infinite feature absorbs into a perfectly plausible finite valuation and
-// the caller optimises against a fabricated stock forever.
-func (c *Net) Score(stocks [][]float64) ([]float64, error) {
+// the caller optimises against a fabricated stock forever. The same holds for
+// ctx.
+func (c *Net) Score(stocks [][]float64, ctx []float64) ([]float64, float64, error) {
 	for i, row := range stocks {
 		if len(row) != c.features {
-			return nil, fmt.Errorf("codex: stock %d has %d features, want %d", i, len(row), c.features)
+			return nil, 0, fmt.Errorf("codex: stock %d has %d features, want %d", i, len(row), c.features)
 		}
 		for j, v := range row {
 			if math.IsNaN(v) || math.IsInf(v, 0) {
-				return nil, fmt.Errorf("codex: stock %d feature %d is %v", i, j, v)
+				return nil, 0, fmt.Errorf("codex: stock %d feature %d is %v", i, j, v)
 			}
+		}
+	}
+	if len(ctx) != c.ctx {
+		return nil, 0, fmt.Errorf("codex: ctx has %d entries, want %d", len(ctx), c.ctx)
+	}
+	for j, v := range ctx {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, 0, fmt.Errorf("codex: ctx entry %d is %v", j, v)
 		}
 	}
 	n := len(stocks)
 	out := make([]float64, n)
 	if n == 0 {
-		return out, nil
+		return out, 0, nil
 	}
 
 	width := 0
@@ -214,7 +247,7 @@ func (c *Net) Score(stocks [][]float64) ([]float64, error) {
 			width = d.out
 		}
 	})
-	embed := c.mix.in / 2
+	embed := (c.mix.in - c.ctx) / 2
 	embeddings := make([]float64, n*embed)
 	front := make([]float64, width)
 	back := make([]float64, width)
@@ -224,7 +257,7 @@ func (c *Net) Score(stocks [][]float64) ([]float64, error) {
 	for i, row := range stocks {
 		src := row
 		for j := range c.enc {
-			src = c.enc[j].forward(front, src, c.act)
+			src = c.enc[j].forward(front, src, c.enc[j].b, c.act)
 			front, back = back, front
 		}
 		copy(embeddings[i*embed:], src)
@@ -240,6 +273,19 @@ func (c *Net) Score(stocks [][]float64) ([]float64, error) {
 		market[j] /= float64(n)
 	}
 
+	// ctx is the same for every item, so its columns fold into the bias once
+	// instead of costing Mix*Context multiply-adds per item. Without context
+	// the bias is the layer's own, which keeps the sums bit-identical.
+	mixBias := c.mix.b
+	if c.ctx > 0 {
+		mixBias = slices.Clone(c.mix.b)
+		for o := range mixBias {
+			for k, x := range ctx {
+				mixBias[o] += c.mix.w[o*c.mix.in+2*embed+k] * x
+			}
+		}
+	}
+
 	// market is loop-invariant, so it goes into the upper half of mixIn once;
 	// the loop below only ever overwrites the lower half.
 	mixIn := make([]float64, 2*embed)
@@ -247,16 +293,26 @@ func (c *Net) Score(stocks [][]float64) ([]float64, error) {
 	last := len(c.head) - 1
 	for i := range n {
 		copy(mixIn, embeddings[i*embed:(i+1)*embed])
-		src := c.mix.forward(front, mixIn, c.act)
+		src := c.mix.forward(front, mixIn, mixBias, c.act)
 		front, back = back, front
 		for j := range c.head[:last] {
-			src = c.head[j].forward(front, src, c.act)
+			src = c.head[j].forward(front, src, c.head[j].b, c.act)
 			front, back = back, front
 		}
-		out[i] = c.head[last].forward(front, src, nil)[0]
+		out[i] = c.head[last].forward(front, src, c.head[last].b, nil)[0]
 		front, back = back, front
 	}
-	return out, nil
+
+	if len(c.pool) == 0 {
+		return out, 0, nil
+	}
+	src := append(market, ctx...)
+	last = len(c.pool) - 1
+	for j := range c.pool[:last] {
+		src = c.pool[j].forward(front, src, c.pool[j].b, c.act)
+		front, back = back, front
+	}
+	return out, c.pool[last].forward(front, src, c.pool[last].b, nil)[0], nil
 }
 
 // Mutated returns a perturbed copy, adding Gaussian noise with standard
@@ -291,10 +347,12 @@ func (c *Net) Mutated(sigma float64, rng *rand.Rand) *Net {
 func (c *Net) Clone() *Net {
 	out := &Net{
 		features: c.features,
+		ctx:      c.ctx,
 		act:      c.act,
 		enc:      slices.Clone(c.enc),
 		mix:      c.mix,
 		head:     slices.Clone(c.head),
+		pool:     slices.Clone(c.pool),
 	}
 	out.each(func(d *dense) {
 		d.w = slices.Clone(d.w)
@@ -305,6 +363,7 @@ func (c *Net) Clone() *Net {
 
 // each visits every layer in a fixed order. Params and SetParams rely on that
 // order being stable, so changing it invalidates every stored parameter vector.
+// The pool comes last, so a vector saved without one is a prefix of one with.
 func (c *Net) each(fn func(d *dense)) {
 	for i := range c.enc {
 		fn(&c.enc[i])
@@ -312,6 +371,9 @@ func (c *Net) each(fn func(d *dense)) {
 	fn(&c.mix)
 	for i := range c.head {
 		fn(&c.head[i])
+	}
+	for i := range c.pool {
+		fn(&c.pool[i])
 	}
 }
 
